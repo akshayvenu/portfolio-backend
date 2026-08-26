@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: portfolio-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: PROJECT_NAME
+        value: Portfolio API
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CORS_ORIGINS
+        sync: false
+      - key: CONTACT_TO_EMAIL
+        sync: false
+      - key: HEVY_API_KEY
+        sync: false
+      - key: HEVY_API_BASE_URL
+        value: https://api.hevyapp.com/v1
+      - key: HEVY_CACHE_TTL_SECONDS
+        value: "3600"
+      - key: HEVY_TIMEZONE
+        value: Asia/Kolkata
