@@ -1,9 +1,17 @@
+import time
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 
+from app.core.config import Settings
+from app.core.exceptions import HevyError
+from app.services.hevy import client as client_module
 from app.services.hevy import snapshot as snapshot_module
+from app.services.hevy.client import HevyClient
 from app.services.hevy.derive import (
     build_heatmap,
     build_records,
@@ -11,14 +19,20 @@ from app.services.hevy.derive import (
     format_tonnes,
     title_case,
 )
+from app.services.hevy.sample import (
+    sample_exercise_templates,
+    sample_routines,
+    sample_workouts,
+)
+from app.services.hevy.snapshot import HevySnapshotService
 
 UTC_TZ = ZoneInfo("UTC")
 
 
 @pytest.fixture(autouse=True)
 def _reset_hevy_cache() -> None:
-    snapshot_module._cache["value"] = None
-    snapshot_module._cache["expires_at"] = 0.0
+    snapshot_module.reset_cache()
+    client_module.reset_caches()
 
 
 async def test_snapshot_endpoint_falls_back_to_sample(client):
@@ -108,3 +122,148 @@ def test_format_count_uses_thousands_separator():
 def test_title_case_splits_on_separators():
     assert title_case("lower_back") == "Lower Back"
     assert title_case("upper-body split") == "Upper Body Split"
+
+
+# --- rate limiting and failure handling ---------------------------------------------
+
+
+def _unthrottled_settings(**overrides) -> Settings:
+    """Real settings with the throttle wound up, so tests do not wait on it."""
+    return Settings(
+        hevy_api_key="test-key",
+        hevy_requests_per_second=1000.0,
+        hevy_request_burst=50,
+        **overrides,
+    )
+
+
+@asynccontextmanager
+async def _mock_hevy_api(handler: Callable[[httpx.Request], httpx.Response]) -> AsyncIterator[None]:
+    client_module._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        yield
+    finally:
+        await client_module._http_client.aclose()
+        client_module._http_client = None
+
+
+async def test_request_retries_after_429():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"retry-after": "0"})
+        return httpx.Response(200, json={"workout_count": 7})
+
+    async with _mock_hevy_api(handler):
+        count = await HevyClient(_unthrottled_settings()).fetch_workout_count()
+
+    assert count == 7
+    assert len(calls) == 2
+
+
+async def test_request_raises_once_retries_are_exhausted():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(429, headers={"retry-after": "0"})
+
+    async with _mock_hevy_api(handler):
+        with pytest.raises(HevyError) as excinfo:
+            await HevyClient(_unthrottled_settings(hevy_max_retries=1)).fetch_workout_count()
+
+    assert excinfo.value.status_code == 429
+    assert len(calls) == 2
+
+
+async def test_exercise_template_catalogue_is_fetched_once():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={"page": 1, "page_count": 1, "exercise_templates": [{"id": "tpl-1"}]},
+        )
+
+    async with _mock_hevy_api(handler):
+        client = HevyClient(_unthrottled_settings())
+        catalogue = await client.fetch_all_exercise_templates()
+        by_id = await client.fetch_exercise_templates({"tpl-1"})
+
+    assert [t["id"] for t in catalogue] == ["tpl-1"]
+    assert set(by_id) == {"tpl-1"}
+    assert len(calls) == 1
+
+
+async def test_rate_limiter_spaces_requests_past_the_burst():
+    limiter = client_module._RateLimiter(rate_per_second=50.0, burst=2)
+
+    started = time.monotonic()
+    for _ in range(4):
+        await limiter.acquire()
+    elapsed = time.monotonic() - started
+
+    # Two acquires come free from the burst; the rest are spaced 20ms apart.
+    assert elapsed >= 0.03
+
+
+class _FakeHevyClient:
+    """Serves sample payloads as if they were live, and can be flipped into failing."""
+
+    def __init__(self, tz: ZoneInfo) -> None:
+        self._tz = tz
+        self.fail = False
+
+    def _guard(self) -> None:
+        if self.fail:
+            raise HevyError("Hevy API 429 for /workouts", 429)
+
+    async def fetch_workouts(self) -> list[dict]:
+        self._guard()
+        return sample_workouts(self._tz)
+
+    async def fetch_routines(self) -> list[dict]:
+        self._guard()
+        return sample_routines()
+
+    async def fetch_workout_count(self) -> int:
+        self._guard()
+        return 42
+
+    async def fetch_exercise_templates(self, ids: set[str]) -> dict[str, dict]:
+        self._guard()
+        return sample_exercise_templates()
+
+
+def _service(settings: Settings) -> tuple[HevySnapshotService, _FakeHevyClient]:
+    fake = _FakeHevyClient(ZoneInfo(settings.hevy_timezone))
+    return HevySnapshotService(settings, fake), fake  # type: ignore[arg-type]
+
+
+async def test_snapshot_serves_last_live_data_when_live_fetch_fails():
+    service, fake = _service(_unthrottled_settings())
+
+    first = await service.get_training_snapshot()
+    assert first.source == "live"
+
+    fake.fail = True
+    snapshot_module._cache_expires_at = 0.0
+    second = await service.get_training_snapshot()
+
+    # Stale live data beats sample data — same snapshot, original synced_at.
+    assert second.source == "live"
+    assert second.synced_at == first.synced_at
+
+
+async def test_failed_build_is_cached_only_briefly():
+    settings = _unthrottled_settings(hevy_cache_ttl_seconds=3600, hevy_fallback_cache_ttl_seconds=5)
+    service, fake = _service(settings)
+    fake.fail = True
+
+    snapshot = await service.get_training_snapshot()
+
+    assert snapshot.source == "sample"
+    assert snapshot_module._cache_expires_at - time.monotonic() <= 5

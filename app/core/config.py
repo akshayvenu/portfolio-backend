@@ -17,6 +17,16 @@ class Settings(BaseSettings):
     hevy_cache_ttl_seconds: int = 3600
     hevy_timezone: str = "Asia/Kolkata"
 
+    # Hevy answers 429 past roughly 5 requests/second; a snapshot build is ~25 paged
+    # requests, so it is throttled and retried rather than allowed to burst.
+    hevy_requests_per_second: float = 3.0
+    hevy_request_burst: int = 4
+    hevy_max_retries: int = 3
+    hevy_template_cache_ttl_seconds: int = 86_400
+    # A failed build is only cached briefly, so one 429 does not pin the page to
+    # fallback data for a whole hevy_cache_ttl_seconds.
+    hevy_fallback_cache_ttl_seconds: int = 120
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

@@ -1,9 +1,9 @@
 """Single entry point for the Side Quest page's training snapshot.
 
 Port of frontend/src/lib/hevy/snapshot.ts. Live Hevy data when a key is
-configured, seeded sample data otherwise — and the sample path is also the
-failure path, so an API outage degrades to a complete-looking page rather
-than a broken one.
+configured, seeded sample data otherwise. A failed live fetch degrades to the
+last good live snapshot, then to sample data, so an API outage shows a
+complete-looking page rather than a broken one.
 """
 
 import asyncio
@@ -27,8 +27,18 @@ from app.services.hevy.sample import sample_exercise_templates, sample_routines,
 
 logger = logging.getLogger(__name__)
 
-_cache: dict[str, object] = {"value": None, "expires_at": 0.0}
+_cached_snapshot: TrainingSnapshot | None = None
+_cache_expires_at: float = 0.0
+_last_live_snapshot: TrainingSnapshot | None = None
 _cache_lock = asyncio.Lock()
+
+
+def reset_cache() -> None:
+    """Drop every cached snapshot (used by tests)."""
+    global _cached_snapshot, _cache_expires_at, _last_live_snapshot
+    _cached_snapshot = None
+    _cache_expires_at = 0.0
+    _last_live_snapshot = None
 
 
 class HevySnapshotService:
@@ -38,25 +48,37 @@ class HevySnapshotService:
         self._tz = ZoneInfo(settings.hevy_timezone)
 
     async def get_training_snapshot(self) -> TrainingSnapshot:
+        global _cached_snapshot, _cache_expires_at
+
         async with _cache_lock:
-            cached = _cache["value"]
-            if cached is not None and time.monotonic() < _cache["expires_at"]:
-                return cached  # type: ignore[return-value]
+            if _cached_snapshot is not None and time.monotonic() < _cache_expires_at:
+                return _cached_snapshot
 
-            snapshot = await self._build_snapshot()
+            snapshot, ttl_seconds = await self._build_snapshot()
 
-            _cache["value"] = snapshot
-            _cache["expires_at"] = time.monotonic() + self._settings.hevy_cache_ttl_seconds
+            _cached_snapshot = snapshot
+            _cache_expires_at = time.monotonic() + ttl_seconds
             return snapshot
 
-    async def _build_snapshot(self) -> TrainingSnapshot:
-        if self._settings.hevy_configured:
-            try:
-                return await self._live_snapshot()
-            except Exception:
-                logger.exception("[hevy] falling back to sample data")
+    async def _build_snapshot(self) -> tuple[TrainingSnapshot, int]:
+        """Returns the snapshot plus how long it is worth caching."""
+        global _last_live_snapshot
 
-        return self._sample_snapshot()
+        if not self._settings.hevy_configured:
+            return self._sample_snapshot(), self._settings.hevy_cache_ttl_seconds
+
+        try:
+            snapshot = await self._live_snapshot()
+        except Exception:
+            logger.exception("[hevy] live fetch failed")
+            # Prefer the last good live data over sample data, and cache it only
+            # briefly: a transient failure (a mid-build 429 is the usual one) should
+            # not hold the page on fallback data for a full TTL.
+            fallback = _last_live_snapshot or self._sample_snapshot()
+            return fallback, self._settings.hevy_fallback_cache_ttl_seconds
+
+        _last_live_snapshot = snapshot
+        return snapshot, self._settings.hevy_cache_ttl_seconds
 
     async def _live_snapshot(self) -> TrainingSnapshot:
         workouts, routines, total_workouts = await asyncio.gather(
