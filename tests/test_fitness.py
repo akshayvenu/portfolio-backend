@@ -14,6 +14,8 @@ from app.services.hevy import snapshot as snapshot_module
 from app.services.hevy.client import HevyClient
 from app.services.hevy.derive import (
     build_heatmap,
+    build_muscle_radar,
+    build_period_comparison,
     build_records,
     format_count,
     format_tonnes,
@@ -108,6 +110,87 @@ def test_build_heatmap_ends_on_sunday_and_covers_full_weeks():
     last_day = datetime.fromisoformat(days[-1].date)
     # ISO weekday 7 = Sunday
     assert last_day.isoweekday() == 7
+
+
+def _exercise(template_id, sets):
+    return {
+        "index": 0,
+        "title": "Test Lift",
+        "notes": None,
+        "exercise_template_id": template_id,
+        "supersets_id": None,
+        "sets": sets,
+    }
+
+
+RADAR_TEMPLATES = {
+    "tpl-lats": {"primary_muscle_group": "lats"},
+    "tpl-traps": {"primary_muscle_group": "traps"},
+    "tpl-quads": {"primary_muscle_group": "quadriceps"},
+    "tpl-cardio": {"primary_muscle_group": "cardio"},
+}
+
+
+def test_build_muscle_radar_collapses_groups_and_compares_windows():
+    now = datetime(2026, 8, 26, 12, 0, 0, tzinfo=UTC)
+    workouts = [
+        # Current window: 2 back (lats) + 1 back (traps) + 1 legs, plus cardio.
+        _workout(
+            "2026-08-20T10:00:00Z",
+            [
+                _exercise("tpl-lats", [_set(60, 8), _set(60, 8)]),
+                _exercise("tpl-traps", [_set(40, 10)]),
+                _exercise("tpl-quads", [_set(80, 8)]),
+                _exercise("tpl-cardio", [_set(reps=1)]),
+            ],
+        ),
+        # Previous window: legs only.
+        _workout("2026-07-20T10:00:00Z", [_exercise("tpl-quads", [_set(80, 8)])]),
+        # Older than both windows — must be ignored entirely.
+        _workout("2026-01-01T10:00:00Z", [_exercise("tpl-lats", [_set(60, 8)])]),
+    ]
+
+    radar = build_muscle_radar(workouts, RADAR_TEMPLATES, UTC_TZ, window_days=30, now=now)
+    by_muscle = {axis.muscle: axis for axis in radar.axes}
+
+    assert [axis.muscle for axis in radar.axes] == [
+        "Back",
+        "Chest",
+        "Core",
+        "Shoulders",
+        "Arms",
+        "Legs",
+    ]
+    # lats + traps fold into Back; cardio has no spoke and is dropped, so the
+    # four counted sets are the whole denominator.
+    assert by_muscle["Back"].current_sets == 3
+    assert by_muscle["Back"].current_share == 0.75
+    assert by_muscle["Legs"].current_sets == 1
+    assert by_muscle["Legs"].previous_sets == 1
+    assert by_muscle["Legs"].previous_share == 1.0
+    assert by_muscle["Back"].previous_sets == 0
+
+
+def test_build_period_comparison_reports_direction_and_flat_windows():
+    now = datetime(2026, 8, 26, 12, 0, 0, tzinfo=UTC)
+    workouts = [
+        _workout("2026-08-20T10:00:00Z", [_exercise("tpl-quads", [_set(100, 10), _set(100, 10)])]),
+        _workout("2026-08-22T10:00:00Z", [_exercise("tpl-quads", [_set(100, 10)])]),
+        _workout("2026-07-20T10:00:00Z", [_exercise("tpl-quads", [_set(100, 10)])]),
+    ]
+
+    comparison = build_period_comparison(workouts, UTC_TZ, window_days=30, now=now)
+    metrics = {m.id: m for m in comparison.metrics}
+
+    assert metrics["workouts"].value == "2"
+    assert metrics["workouts"].delta == "1"
+    assert metrics["workouts"].direction == "up"
+    assert metrics["sets"].value == "3"
+    assert metrics["volume"].value == "3,000"
+    assert metrics["volume"].delta == "2,000 kg"
+    # `_workout` gives every session a zero-length duration, so that one is flat.
+    assert metrics["duration"].direction == "flat"
+    assert metrics["duration"].delta is None
 
 
 def test_format_tonnes_switches_precision_at_100000kg():

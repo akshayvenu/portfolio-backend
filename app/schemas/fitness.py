@@ -105,6 +105,40 @@ class MuscleSplitSlice(CamelModel):
     share: float
 
 
+class MuscleRadarAxis(CamelModel):
+    """One spoke of the muscle-distribution radar, current window vs the one before."""
+
+    muscle: str
+    current_sets: int
+    previous_sets: int
+    #: Share of the window's working sets, 0–1. Radii are drawn from these so the
+    #: two polygons stay comparable even when total volume differs between windows.
+    current_share: float
+    previous_share: float
+
+
+class MuscleRadar(CamelModel):
+    window_days: int
+    axes: list[MuscleRadarAxis] = []
+
+
+class PeriodMetric(CamelModel):
+    """A headline number for the current window plus its change on the previous one."""
+
+    id: str
+    label: str
+    value: str
+    unit: str | None = None
+    #: Signed, pre-formatted change (e.g. "1", "46min"). `None` when unchanged.
+    delta: str | None = None
+    direction: str = "flat"  # up | down | flat
+
+
+class PeriodComparison(CamelModel):
+    window_days: int
+    metrics: list[PeriodMetric] = []
+
+
 class PersonalRecord(CamelModel):
     exercise: str
     exercise_template_id: str
@@ -146,6 +180,8 @@ class TrainingSnapshot(CamelModel):
     stats: list[TrainingStat]
     heatmap: list[HeatmapDay]
     muscle_split: list[MuscleSplitSlice]
+    muscle_radar: MuscleRadar
+    period_comparison: PeriodComparison
     records: list[PersonalRecord]
     workouts: list[WorkoutSummary]
     routines: list[RoutineSummary]

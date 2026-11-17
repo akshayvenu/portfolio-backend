@@ -17,7 +17,9 @@ from app.schemas.fitness import TrainingSnapshot
 from app.services.hevy.client import HevyClient
 from app.services.hevy.derive import (
     build_heatmap,
+    build_muscle_radar,
     build_muscle_split,
+    build_period_comparison,
     build_records,
     build_stats,
     summarise_routines,
@@ -120,6 +122,8 @@ class HevySnapshotService:
             stats=build_stats(workouts, total_workouts, self._tz),
             heatmap=build_heatmap(workouts, self._tz),
             muscle_split=build_muscle_split(workouts, templates),
+            muscle_radar=build_muscle_radar(workouts, templates, self._tz),
+            period_comparison=build_period_comparison(workouts, self._tz),
             records=build_records(workouts),
             workouts=summarise_workouts(workouts, templates),
             routines=summarise_routines(routines, templates),

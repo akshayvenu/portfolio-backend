@@ -12,7 +12,11 @@ from zoneinfo import ZoneInfo
 
 from app.schemas.fitness import (
     HeatmapDay,
+    MuscleRadar,
+    MuscleRadarAxis,
     MuscleSplitSlice,
+    PeriodComparison,
+    PeriodMetric,
     PersonalRecord,
     RoutineSummary,
     TrainingStat,
@@ -21,6 +25,20 @@ from app.schemas.fitness import (
 )
 
 DAY = timedelta(days=1)
+
+#: Hevy reports ~20 primary muscle groups; the radar reads best at six spokes, so
+#: they collapse into the coarse regions a training split is actually planned
+#: around. Order matters — it is the drawing order, clockwise from upper-left.
+RADAR_AXES: list[tuple[str, tuple[str, ...]]] = [
+    ("Back", ("lats", "upper_back", "lower_back", "traps")),
+    ("Chest", ("chest",)),
+    ("Core", ("abdominals",)),
+    ("Shoulders", ("shoulders", "neck")),
+    ("Arms", ("biceps", "triceps", "forearms")),
+    ("Legs", ("quadriceps", "hamstrings", "glutes", "calves", "abductors", "adductors")),
+]
+
+_RADAR_LOOKUP: dict[str, str] = {group: axis for axis, groups in RADAR_AXES for group in groups}
 
 
 def _is_working_set(s: dict) -> bool:
@@ -163,6 +181,156 @@ def build_muscle_split(
     ]
     slices.sort(key=lambda s: s.sets, reverse=True)
     return slices[:limit]
+
+
+def _split_windows(
+    workouts: list[dict], window_days: int, now: datetime
+) -> tuple[list[dict], list[dict]]:
+    """Workouts in the last `window_days`, and in the equal-length window before it."""
+    current_start = now - window_days * DAY
+    previous_start = current_start - window_days * DAY
+
+    current, previous = [], []
+    for workout in workouts:
+        started = _parse_iso(workout["start_time"])
+        if started >= current_start:
+            current.append(workout)
+        elif started >= previous_start:
+            previous.append(workout)
+    return current, previous
+
+
+def _radar_sets(workouts: list[dict], templates: dict[str, dict]) -> dict[str, int]:
+    by_axis: dict[str, int] = {}
+    for workout in workouts:
+        for exercise in workout["exercises"]:
+            template = templates.get(exercise["exercise_template_id"])
+            if not template:
+                continue
+            # Cardio / full-body templates have no honest home on a six-spoke
+            # split, so they sit the chart out rather than distorting a region.
+            axis = _RADAR_LOOKUP.get(template["primary_muscle_group"])
+            if not axis:
+                continue
+            by_axis[axis] = by_axis.get(axis, 0) + sum(
+                1 for s in exercise["sets"] if _is_working_set(s)
+            )
+    return by_axis
+
+
+def build_muscle_radar(
+    workouts: list[dict],
+    templates: dict[str, dict],
+    tz: ZoneInfo,
+    window_days: int = 30,
+    now: datetime | None = None,
+) -> MuscleRadar:
+    """Set distribution across six muscle regions, this window against the last.
+
+    Shares rather than raw counts: the point of the overlay is whether the shape
+    of the split moved, which a heavier month would otherwise swamp.
+    """
+    now = now or datetime.now(tz)
+    current_workouts, previous_workouts = _split_windows(workouts, window_days, now)
+
+    current = _radar_sets(current_workouts, templates)
+    previous = _radar_sets(previous_workouts, templates)
+    current_total = sum(current.values())
+    previous_total = sum(previous.values())
+
+    axes = [
+        MuscleRadarAxis(
+            muscle=axis,
+            current_sets=current.get(axis, 0),
+            previous_sets=previous.get(axis, 0),
+            current_share=current.get(axis, 0) / current_total if current_total else 0.0,
+            previous_share=previous.get(axis, 0) / previous_total if previous_total else 0.0,
+        )
+        for axis, _ in RADAR_AXES
+    ]
+
+    return MuscleRadar(window_days=window_days, axes=axes)
+
+
+def _format_minutes(minutes: int) -> tuple[str, str | None]:
+    if minutes < 60:
+        return str(minutes), "min"
+    hours, rest = divmod(minutes, 60)
+    return (f"{hours}h {rest}min" if rest else f"{hours}h"), None
+
+
+def build_period_comparison(
+    workouts: list[dict],
+    tz: ZoneInfo,
+    window_days: int = 30,
+    now: datetime | None = None,
+) -> PeriodComparison:
+    """The four headline numbers for the window, each with its period-on-period move."""
+    now = now or datetime.now(tz)
+    current, previous = _split_windows(workouts, window_days, now)
+
+    def totals(bucket: list[dict]) -> dict[str, int]:
+        return {
+            "workouts": len(bucket),
+            "duration": sum(workout_minutes(w) for w in bucket),
+            "volume": round(sum(workout_volume_kg(w) for w in bucket)),
+            "sets": sum(workout_set_count(w) for w in bucket),
+        }
+
+    now_totals, then_totals = totals(current), totals(previous)
+
+    def metric(
+        metric_id: str, label: str, value: str, unit: str | None, delta_text: str | None
+    ) -> PeriodMetric:
+        change = now_totals[metric_id] - then_totals[metric_id]
+        direction = "up" if change > 0 else "down" if change < 0 else "flat"
+        return PeriodMetric(
+            id=metric_id,
+            label=label,
+            value=value,
+            unit=unit,
+            delta=delta_text if change else None,
+            direction=direction,
+        )
+
+    duration_value, duration_unit = _format_minutes(now_totals["duration"])
+    duration_change = abs(now_totals["duration"] - then_totals["duration"])
+    duration_delta, duration_delta_unit = _format_minutes(duration_change)
+    volume_change = now_totals["volume"] - then_totals["volume"]
+
+    return PeriodComparison(
+        window_days=window_days,
+        metrics=[
+            metric(
+                "workouts",
+                "Workouts",
+                format_count(now_totals["workouts"]),
+                None,
+                format_count(abs(now_totals["workouts"] - then_totals["workouts"])),
+            ),
+            metric(
+                "duration",
+                "Duration",
+                duration_value,
+                duration_unit,
+                f"{duration_delta}{duration_delta_unit or ''}",
+            ),
+            metric(
+                "volume",
+                "Volume",
+                format_count(now_totals["volume"]),
+                "kg",
+                f"{format_count(abs(volume_change))} kg",
+            ),
+            metric(
+                "sets",
+                "Sets",
+                format_count(now_totals["sets"]),
+                None,
+                format_count(abs(now_totals["sets"] - then_totals["sets"])),
+            ),
+        ],
+    )
 
 
 def build_records(workouts: list[dict], limit: int | None = 5) -> list[PersonalRecord]:
